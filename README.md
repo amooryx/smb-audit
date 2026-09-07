@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="./banner.svg" alt="smb-audit" width="800">
+</div>
+
 # smb-audit
 
 > Red team post-exploitation tool — authorized use only.
