@@ -1,8 +1,8 @@
-﻿# smb-audit
+# smb-audit
 
 > Red team post-exploitation tool — authorized use only.
 
-`ash
+```bash
 python smb_audit.py --help
 ```
 
