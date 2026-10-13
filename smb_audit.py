@@ -13,6 +13,7 @@ import socket
 import struct
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
 try:
     from impacket.smbconnection import SMBConnection, SessionError
@@ -22,8 +23,63 @@ except ImportError:
     HAS_IMPACKET = False
 
 # ─── Raw SMB1 negotiation (no impacket needed) ────────────────────────────────
-def check_smbv1_raw(host: str, port: int = 445, timeout: float = 8) -> bool:
-    """Check if SMBv1 is offered without impacket (raw negotiate)."""
+MAX_SMB_RESPONSE_SIZE = 4096
+SMB1_DIALECT_COUNT = 5
+
+
+def _recv_exact(sock: socket.socket, size: int) -> Optional[bytes]:
+    """Read exactly size bytes, returning None if the peer closes early."""
+    data = bytearray()
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            return None
+        data.extend(chunk)
+    return bytes(data)
+
+
+def _read_netbios_frame(sock: socket.socket) -> Optional[bytes]:
+    """Read one bounded NetBIOS session-service frame."""
+    header = _recv_exact(sock, 4)
+    if header is None or header[0] != 0 or header[1] & 0xFE:
+        return None
+
+    length = ((header[1] & 0x01) << 16) | (header[2] << 8) | header[3]
+    if length == 0 or length > MAX_SMB_RESPONSE_SIZE:
+        return None
+    return _recv_exact(sock, length)
+
+
+def _parse_smbv1_negotiate(response: bytes) -> Optional[bool]:
+    """Return whether an SMB1 dialect was accepted, or None for invalid evidence."""
+    if (len(response) < 33 or response[:4] != b"\xffSMB"
+            or response[4] != 0x72 or not response[9] & 0x80):
+        return None
+
+    word_count = response[32]
+    byte_count_offset = 33 + word_count * 2
+    if len(response) < byte_count_offset + 2:
+        return None
+    byte_count = struct.unpack_from("<H", response, byte_count_offset)[0]
+    if len(response) < byte_count_offset + 2 + byte_count:
+        return None
+
+    status = struct.unpack_from("<I", response, 5)[0]
+    if status != 0:
+        return False
+    if word_count < 1:
+        return None
+
+    dialect_index = struct.unpack_from("<H", response, 33)[0]
+    if dialect_index == 0xFFFF:
+        return False
+    if dialect_index < SMB1_DIALECT_COUNT:
+        return True
+    return None
+
+
+def check_smbv1_raw(host: str, port: int = 445, timeout: float = 8) -> Optional[bool]:
+    """Probe SMBv1; None means the response was unavailable or inconclusive."""
     smb1_negotiate = (
         b"\x00\x00\x00\x85"       # NetBIOS length
         b"\xff\x53\x4d\x42"       # SMB header: \xFF SMB
@@ -42,16 +98,14 @@ def check_smbv1_raw(host: str, port: int = 445, timeout: float = 8) -> bool:
         b"\x02\x4e\x54\x20\x4c\x4d\x20\x30\x2e\x31\x32\x00"
     )
     try:
-        sock = socket.create_connection((host, port), timeout=timeout)
-        sock.sendall(smb1_negotiate)
-        resp = sock.recv(256)
-        sock.close()
-        if len(resp) > 4 and resp[4:8] == b"\xff\x53\x4d\x42":
-            dialect_idx = struct.unpack_from("<H", resp, 37)[0] if len(resp) > 39 else 0
-            return dialect_idx in (0, 1, 2, 3, 4)  # SMBv1 dialects accepted
-    except Exception:
-        pass
-    return False
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.sendall(smb1_negotiate)
+            response = _read_netbios_frame(sock)
+        if response is None:
+            return None
+        return _parse_smbv1_negotiate(response)
+    except OSError:
+        return None
 
 def check_null_session(host: str) -> dict:
     """Try anonymous null session (no creds)."""
@@ -108,8 +162,8 @@ def scan_host(host: str, user: str, password: str) -> dict:
 
     # Flag critical issues
     result["findings"] = []
-    if result["smbv1"]:
-        result["findings"].append({"severity": "High", "issue": "SMBv1 enabled — vulnerable to EternalBlue/WannaCry"})
+    if result["smbv1"] is True:
+        result["findings"].append({"severity": "High", "issue": "SMBv1 negotiation accepted — legacy protocol enabled"})
     ns = result["null_session"]
     if isinstance(ns, dict) and ns.get("null_session"):
         result["findings"].append({"severity": "High", "issue": f"Null session allowed — shares visible: {ns.get('shares', [])}"})
